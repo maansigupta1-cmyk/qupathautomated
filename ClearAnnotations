@@ -1,0 +1,17 @@
+// Clear all annotations from the current image in QuPath
+
+def imageData = getCurrentImageData()
+def hierarchy = imageData.getHierarchy()
+
+def annotations = hierarchy.getAnnotationObjects()
+
+if (annotations.isEmpty()) {
+    println "No annotations found. Nothing to clear."
+} else {
+    int count = annotations.size()
+
+    hierarchy.removeObjects(annotations, true)
+    fireHierarchyUpdate()
+
+    println "Removed ${count} annotations."
+}
