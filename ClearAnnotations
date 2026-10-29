@@ -1,17 +1,23 @@
-// Clear all annotations from the current image in QuPath
+// Remove all unlocked annotations from the current image
 
 def imageData = getCurrentImageData()
 def hierarchy = imageData.getHierarchy()
 
 def annotations = hierarchy.getAnnotationObjects()
 
-if (annotations.isEmpty()) {
-    println "No annotations found. Nothing to clear."
-} else {
-    int count = annotations.size()
+// Keep only annotations that are not locked
+def unlockedAnnotations = annotations.findAll {
+    !it.isLocked()
+}
 
-    hierarchy.removeObjects(annotations, true)
+if (unlockedAnnotations.isEmpty()) {
+    println "No unlocked annotations found. Nothing to clear."
+} else {
+    int count = unlockedAnnotations.size()
+
+    hierarchy.removeObjects(unlockedAnnotations, true)
     fireHierarchyUpdate()
 
-    println "Removed ${count} annotations."
+    println "Removed ${count} unlocked annotations."
+    println "Locked annotations were preserved."
 }
