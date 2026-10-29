@@ -1,0 +1,420 @@
+import qupath.lib.regions.RegionRequest
+import qupath.lib.regions.ImagePlane
+import qupath.lib.roi.ROIs
+import qupath.lib.objects.PathObjects
+import qupath.lib.geom.Point2
+
+import ij.process.ByteProcessor
+import ij.process.FloatProcessor
+import ij.gui.Wand
+import ij.plugin.filter.GaussianBlur
+
+// ============================================================
+// 1. GET IMAGE AND SELECTED WELL ROI
+// ============================================================
+
+def imageData = getCurrentImageData()
+def server = imageData.getServer()
+def hierarchy = imageData.getHierarchy()
+
+def selectedObjects = hierarchy.getSelectionModel().getSelectedObjects()
+
+if (selectedObjects.isEmpty()) {
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "Select the annotation outlining the inside of the well, then run again."
+    )
+    return
+}
+
+def wellObject = selectedObjects.find { it.getROI() != null }
+
+if (wellObject == null) {
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "The selected object has no ROI."
+    )
+    return
+}
+
+def wellROI = wellObject.getROI()
+
+if (wellROI.isEmpty()) {
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "The selected ROI is empty."
+    )
+    return
+}
+
+// ============================================================
+// 2. DETECTION SETTINGS
+// ============================================================
+
+def sigmaText = qupath.lib.gui.dialogs.Dialogs.showInputDialog(
+    "Spot detection",
+    "Local background radius in pixels (try 8):",
+    "8"
+)
+if (sigmaText == null)
+    return
+
+def contrastText = qupath.lib.gui.dialogs.Dialogs.showInputDialog(
+    "Spot detection",
+    "Minimum darkness relative to local background, 0-255 (try 12):",
+    "12"
+)
+if (contrastText == null)
+    return
+
+def minAreaText = qupath.lib.gui.dialogs.Dialogs.showInputDialog(
+    "Spot detection",
+    "Minimum spot area in pixels (try 10):",
+    "10"
+)
+if (minAreaText == null)
+    return
+
+def maxAreaText = qupath.lib.gui.dialogs.Dialogs.showInputDialog(
+    "Spot detection",
+    "Maximum spot area in pixels (0 disables maximum; try 5000):",
+    "5000"
+)
+if (maxAreaText == null)
+    return
+
+def marginText = qupath.lib.gui.dialogs.Dialogs.showInputDialog(
+    "Spot detection",
+    "Exclude detections this close to the well boundary, in pixels (try 3):",
+    "3"
+)
+if (marginText == null)
+    return
+
+double backgroundSigma
+double contrastThreshold
+int minArea
+int maxArea
+int edgeMargin
+
+try {
+    backgroundSigma = Double.parseDouble(sigmaText.trim())
+    contrastThreshold = Double.parseDouble(contrastText.trim())
+    minArea = Integer.parseInt(minAreaText.trim())
+    maxArea = Integer.parseInt(maxAreaText.trim())
+    edgeMargin = Integer.parseInt(marginText.trim())
+} catch (Exception e) {
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "Please enter valid numeric values."
+    )
+    return
+}
+
+if (backgroundSigma <= 0 ||
+    contrastThreshold < 0 || contrastThreshold > 255 ||
+    minArea < 1 || maxArea < 0 || edgeMargin < 0) {
+
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "Use a positive background radius, contrast from 0-255, minimum area of at least 1, and non-negative maximum area and edge margin."
+    )
+    return
+}
+
+// ============================================================
+// 3. READ THE SELECTED WELL
+// ============================================================
+
+int x0 = (int)Math.floor(wellROI.getBoundsX())
+int y0 = (int)Math.floor(wellROI.getBoundsY())
+int x1 = (int)Math.ceil(wellROI.getBoundsX() + wellROI.getBoundsWidth())
+int y1 = (int)Math.ceil(wellROI.getBoundsY() + wellROI.getBoundsHeight())
+
+int width = x1 - x0
+int height = y1 - y0
+
+if (width < 1 || height < 1) {
+    qupath.lib.gui.dialogs.Dialogs.showErrorMessage(
+        "Spot detection",
+        "The selected ROI has invalid dimensions."
+    )
+    return
+}
+
+def plane = ImagePlane.getPlane(
+    wellROI.getZ(),
+    wellROI.getT()
+)
+
+def request = RegionRequest.createInstance(
+    server.getPath(),
+    1.0,
+    x0,
+    y0,
+    width,
+    height,
+    wellROI.getZ(),
+    wellROI.getT()
+)
+
+def regionImage = server.readBufferedImage(request)
+def raster = regionImage.getRaster()
+int numBands = raster.getNumBands()
+
+// ============================================================
+// 4. CONVERT IMAGE TO GRAYSCALE
+// ============================================================
+
+// Store grayscale intensity in a floating-point image.
+// This preserves values for local-background calculations.
+
+def grayImage = new FloatProcessor(width, height)
+
+for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+
+        int gray
+
+        if (numBands >= 3) {
+            int r = raster.getSample(x, y, 0)
+            int g = raster.getSample(x, y, 1)
+            int b = raster.getSample(x, y, 2)
+
+            gray = (int)(0.299 * r + 0.587 * g + 0.114 * b)
+        } else {
+            gray = raster.getSample(x, y, 0)
+        }
+
+        grayImage.setf(y * width + x, gray)
+    }
+}
+
+// ============================================================
+// 5. ESTIMATE LOCAL BACKGROUND
+// ============================================================
+
+// Gaussian blur estimates the slowly varying background.
+// Spots darker than this local background will be detected.
+
+def background = grayImage.duplicate()
+
+new GaussianBlur().blurGaussian(
+    background,
+    backgroundSigma,
+    backgroundSigma,
+    0.01
+)
+
+// ============================================================
+// 6. CREATE MASK USING LOCAL CONTRAST
+// ============================================================
+
+// White = candidate spot pixel.
+// Black = background or excluded pixel.
+
+def mask = new ByteProcessor(width, height)
+mask.setValue(0)
+mask.fill()
+
+for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+
+        double imageX = x0 + x + 0.5
+        double imageY = y0 + y + 0.5
+
+        // Keep detections inside the selected well ROI.
+        if (!wellROI.contains(imageX, imageY))
+            continue
+
+        // Exclude pixels too close to the ROI boundary.
+        // Check eight surrounding positions so the margin
+        // follows the ROI rather than just its bounding box.
+        if (edgeMargin > 0) {
+            boolean nearBoundary = false
+
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+
+                    if (dx == 0 && dy == 0)
+                        continue
+
+                    double testX = imageX + dx * edgeMargin
+                    double testY = imageY + dy * edgeMargin
+
+                    if (!wellROI.contains(testX, testY)) {
+                        nearBoundary = true
+                        break
+                    }
+                }
+
+                if (nearBoundary)
+                    break
+            }
+
+            if (nearBoundary)
+                continue
+        }
+
+        float localBackground = background.getf(y * width + x)
+        float pixelValue = grayImage.getf(y * width + x)
+
+        double localDarkness = localBackground - pixelValue
+
+        if (localDarkness >= contrastThreshold)
+            mask.set(x, y, 255)
+    }
+}
+
+// ============================================================
+// 7. NO WATERSHED
+// ============================================================
+
+// Watershed is deliberately disabled for this version.
+// The mask is used directly to preserve the thresholded shapes.
+
+// ============================================================
+// 8. FIND INDIVIDUAL CONNECTED REGIONS
+// ============================================================
+
+def detectedAnnotations = []
+def visited = new boolean[width * height]
+
+int detectedCount = 0
+int rejectedAreaCount = 0
+int rejectedContourCount = 0
+
+for (int y = 0; y < height; y++) {
+    for (int x = 0; x < width; x++) {
+
+        int index = y * width + x
+
+        if (visited[index])
+            continue
+
+        if (mask.get(x, y) == 0) {
+            visited[index] = true
+            continue
+        }
+
+        // Flood-fill one connected region.
+        def queue = new ArrayList<Integer>()
+        queue.add(index)
+        visited[index] = true
+
+        int head = 0
+        int area = 0
+        int seedX = x
+        int seedY = y
+
+        while (head < queue.size()) {
+
+            int current = queue.get(head++)
+            int cx = current % width
+            int cy = (int)(current / width)
+
+            area++
+
+            // Eight-neighbour connectivity.
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dx = -1; dx <= 1; dx++) {
+
+                    if (dx == 0 && dy == 0)
+                        continue
+
+                    int nx = cx + dx
+                    int ny = cy + dy
+
+                    if (nx < 0 || ny < 0 ||
+                        nx >= width || ny >= height)
+                        continue
+
+                    int neighborIndex = ny * width + nx
+
+                    if (visited[neighborIndex])
+                        continue
+
+                    visited[neighborIndex] = true
+
+                    if (mask.get(nx, ny) != 0)
+                        queue.add(neighborIndex)
+                }
+            }
+        }
+
+        // Filter by component area.
+        if (area < minArea ||
+            (maxArea > 0 && area > maxArea)) {
+
+            rejectedAreaCount++
+            continue
+        }
+
+        // ====================================================
+        // 9. TRACE THIS REGION AS A POLYGON
+        // ====================================================
+
+        def wand = new Wand(mask)
+
+        wand.autoOutline(
+            seedX,
+            seedY,
+            255.0,
+            255.0,
+            Wand.EIGHT_CONNECTED
+        )
+
+        if (wand.npoints < 3) {
+            rejectedContourCount++
+            continue
+        }
+
+        def points = new ArrayList<Point2>()
+
+        for (int i = 0; i < wand.npoints; i++) {
+            points.add(new Point2(
+                x0 + wand.xpoints[i],
+                y0 + wand.ypoints[i]
+            ))
+        }
+
+        def polygonROI = ROIs.createPolygonROI(points, plane)
+        def annotation = PathObjects.createAnnotationObject(polygonROI)
+
+        detectedAnnotations.add(annotation)
+        detectedCount++
+    }
+}
+
+// ============================================================
+// 10. ADD ANNOTATIONS
+// ============================================================
+
+if (!detectedAnnotations.isEmpty()) {
+
+    // QuPath 0.7.0 API
+    hierarchy.addObjects(detectedAnnotations)
+
+    hierarchy.getSelectionModel().setSelectedObjects(
+        detectedAnnotations,
+        detectedAnnotations[0]
+    )
+
+    fireHierarchyUpdate()
+}
+
+// ============================================================
+// 11. REPORT RESULTS
+// ============================================================
+
+println "========================================"
+println "LOCAL-CONTRAST SPOT DETECTION COMPLETE"
+println "Created annotations: ${detectedCount}"
+println "Rejected by area: ${rejectedAreaCount}"
+println "Rejected contours: ${rejectedContourCount}"
+println "Background radius: ${backgroundSigma} pixels"
+println "Local contrast threshold: ${contrastThreshold}"
+println "Minimum area: ${minArea} pixels"
+println "Maximum area: ${maxArea == 0 ? 'disabled' : maxArea}"
+println "Boundary margin: ${edgeMargin} pixels"
+println "========================================"
