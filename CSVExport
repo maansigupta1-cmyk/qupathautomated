@@ -1,0 +1,342 @@
+
+import qupath.lib.projects.Projects
+import qupath.lib.roi.RoiTools
+import java.util.Locale
+
+// ============================================================
+// ELISPOT MEASUREMENT EXPORT ONLY
+// QuPath 0.7.0
+//
+// Run AFTER the well and spot detection script.
+//
+// Does not detect spots, create annotations, or change data.
+//
+// Output: ELISpot_well_spot_measurements.csv
+// One row per project image.
+// ============================================================
+
+def exportELISpotMeasurementsOnly = { ->
+
+    // --------------------------------------------------------
+    // SETTINGS
+    // --------------------------------------------------------
+
+    String OUTPUT_FILENAME =
+        "ELISpot_well_spot_measurements.csv"
+
+    String WELL_NAME = "Well"
+    String SPOT_NAME = "ELISpot spots (merged)"
+
+    String AUTO_METADATA_KEY = "ELISpot.Automatic"
+
+
+    // --------------------------------------------------------
+    // GET PROJECT
+    // --------------------------------------------------------
+
+    def project = getProject()
+
+    if (project == null) {
+        print "ERROR: Open a QuPath project first."
+        return
+    }
+
+    def projectDir = Projects.getBaseDirectory(project)
+
+    if (projectDir == null) {
+        print "ERROR: No local project folder found."
+        return
+    }
+
+    def entries = project.getImageList()
+
+    if (entries.isEmpty()) {
+        print "ERROR: Project contains no images."
+        return
+    }
+
+    File outputFile = new File(
+        projectDir,
+        OUTPUT_FILENAME
+    )
+
+
+    // --------------------------------------------------------
+    // CSV FORMATTING
+    // --------------------------------------------------------
+
+    def csvQuote = { Object value ->
+
+        '"' +
+        String.valueOf(
+            value == null ? "" : value
+        ).replace('"', '""') +
+        '"'
+    }
+
+    def numberText = { Number value ->
+
+        value == null ?
+            "" :
+            String.format(
+                Locale.US,
+                "%.4f",
+                value.doubleValue()
+            )
+    }
+
+
+    // --------------------------------------------------------
+    // SELECT THE CORRECT ANNOTATION
+    //
+    // Prefer automatically generated annotations.
+    // If more than one remains, use the largest.
+    // --------------------------------------------------------
+
+    def chooseAnnotation = {
+        List candidates,
+        String label,
+        String imageName ->
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        def automatic = candidates.findAll { annotation ->
+
+            annotation.getMetadata()?.get(
+                AUTO_METADATA_KEY
+            ) == "true"
+        }
+
+        def chosenFrom = automatic.isEmpty() ?
+            candidates :
+            automatic
+
+        if (chosenFrom.size() > 1) {
+
+            print "WARNING: ${imageName}: " +
+                  "Multiple ${label} annotations found. " +
+                  "Using the largest."
+        }
+
+        chosenFrom.max { annotation ->
+            annotation.getROI().getArea()
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // PROCESS PROJECT IMAGES
+    // --------------------------------------------------------
+
+    int successful = 0
+    int missingWells = 0
+    int noSpots = 0
+    int failed = 0
+
+    outputFile.withWriter("UTF-8") { writer ->
+
+        // Write the CSV header.
+
+        writer.writeLine(
+            '"Image filename",' +
+            '"Total well area (px^2)",' +
+            '"Total detected spot area (px^2)",' +
+            '"Well covered by spots (%)"'
+        )
+
+        for (def entry : entries) {
+
+            String imageName = entry.getImageName()
+            String quotedName = csvQuote(imageName)
+
+            try {
+
+                // --------------------------------------------
+                // READ SAVED ANNOTATIONS
+                //
+                // This does not load the full image pixels.
+                // --------------------------------------------
+
+                def hierarchy = entry.readHierarchy()
+
+                def annotations =
+                    hierarchy.getAnnotationObjects()
+
+
+                // --------------------------------------------
+                // FIND WELL ANNOTATION
+                // --------------------------------------------
+
+                def wells = annotations.findAll { annotation ->
+
+                    annotation.getName() == WELL_NAME &&
+                    annotation.getROI() != null &&
+                    annotation.getROI().isArea()
+                }
+
+                def wellObject = chooseAnnotation(
+                    wells,
+                    "Well",
+                    imageName
+                )
+
+                if (wellObject == null) {
+
+                    writer.writeLine(
+                        "${quotedName},,,"
+                    )
+
+                    missingWells++
+
+                    print "WARNING: ${imageName}: " +
+                          "No saved Well annotation found."
+
+                    continue
+                }
+
+                def wellROI = wellObject.getROI()
+
+                double wellArea = wellROI.getArea()
+
+                if (!(wellArea > 0.0) ||
+                    !Double.isFinite(wellArea)) {
+
+                    writer.writeLine(
+                        "${quotedName},,,"
+                    )
+
+                    failed++
+
+                    print "WARNING: ${imageName}: " +
+                          "Invalid well area."
+
+                    continue
+                }
+
+
+                // --------------------------------------------
+                // FIND MERGED SPOT ANNOTATION
+                // --------------------------------------------
+
+                def mergedSpots = annotations.findAll { annotation ->
+
+                    annotation.getName() == SPOT_NAME &&
+                    annotation.getROI() != null &&
+                    annotation.getROI().isArea()
+                }
+
+                def spotObject = chooseAnnotation(
+                    mergedSpots,
+                    "merged Spot",
+                    imageName
+                )
+
+
+                // --------------------------------------------
+                // CALCULATE TOTAL SPOT AREA
+                //
+                // Only area INSIDE the well is included.
+                // --------------------------------------------
+
+                double spotArea = 0.0
+
+                if (spotObject != null) {
+
+                    spotArea = RoiTools.intersectionArea(
+                        wellROI,
+                        spotObject.getROI()
+                    )
+
+                } else {
+
+                    noSpots++
+
+                    print "WARNING: ${imageName}: " +
+                          "No merged spot annotation found. " +
+                          "Recording spot area as 0."
+                }
+
+                if (!Double.isFinite(spotArea) ||
+                    spotArea < 0.0) {
+
+                    throw new IllegalStateException(
+                        "Invalid spot area calculated"
+                    )
+                }
+
+
+                // --------------------------------------------
+                // CALCULATE PERCENTAGE COVERAGE
+                // --------------------------------------------
+
+                double coveredPercent =
+                    100.0 * spotArea / wellArea
+
+
+                // --------------------------------------------
+                // WRITE ONE CSV ROW
+                // --------------------------------------------
+
+                writer.writeLine([
+
+                    quotedName,
+
+                    numberText(wellArea),
+
+                    numberText(spotArea),
+
+                    numberText(coveredPercent)
+
+                ].join(","))
+
+                successful++
+
+                print "OK: ${imageName} | " +
+                      "Well=${numberText(wellArea)} px^2 | " +
+                      "Spots=${numberText(spotArea)} px^2 | " +
+                      "Coverage=${numberText(coveredPercent)}%"
+
+            } catch (Exception error) {
+
+                // Keep a row for failed images.
+                // Leave their numerical fields blank.
+
+                writer.writeLine(
+                    "${quotedName},,,"
+                )
+
+                failed++
+
+                print "ERROR: ${imageName}: " +
+                      "${error.getClass().getSimpleName()}: " +
+                      "${error.getMessage()}"
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // FINAL SUMMARY
+    // --------------------------------------------------------
+
+    print "========================================"
+    print "ELISPOT MEASUREMENT EXPORT COMPLETE"
+    print "========================================"
+
+    print "Project images: ${entries.size()}"
+    print "Rows with measurements: ${successful}"
+    print "Missing Well annotations: ${missingWells}"
+    print "Rows without merged spots: ${noSpots}"
+    print "Other failed rows: ${failed}"
+
+    print "CSV saved to:"
+    print outputFile.getAbsolutePath()
+
+    print "No annotations were changed."
+
+    print "========================================"
+}
+
+exportELISpotMeasurementsOnly()
