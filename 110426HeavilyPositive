@@ -1,0 +1,1824 @@
+
+import qupath.lib.regions.RegionRequest
+import qupath.lib.regions.ImagePlane
+import qupath.lib.roi.ROIs
+import qupath.lib.roi.RoiTools
+import qupath.lib.objects.PathObjects
+import qupath.lib.geom.Point2
+import qupath.imagej.processing.IJProcessing
+import qupath.imagej.tools.IJTools
+
+import ij.process.FloatProcessor
+import ij.process.ByteProcessor
+import ij.process.ImageProcessor
+import ij.plugin.filter.GaussianBlur
+import ij.plugin.filter.EDM
+import ij.gui.Wand
+
+import java.util.Arrays
+import java.util.Locale
+
+
+// ============================================================
+// AUTOMATIC ELISPOT DETECTION
+// QuPath 0.7.0
+//
+// Creates two annotations:
+//   1. Well                    (Region)
+//   2. ELISpot spots (merged)  (Spot)
+//
+// Detection modes:
+//   AUTO       - Automatically evaluate peripheral staining
+//   STANDARD   - Original detection for ordinary wells
+//   CONFLUENT  - Retain extensive peripheral staining
+//
+// No manual well annotation is required.
+//
+// Compatible with the separate CSV measurement export script.
+// ============================================================
+
+def analyzeELISpot = { ->
+
+    // ========================================================
+    // USER SETTINGS
+    // ========================================================
+
+    String PERIPHERAL_DETECTION_MODE = "AUTO"
+
+    // Main detection settings
+    double BACKGROUND_RADIUS = 25.0
+    double BROAD_BACKGROUND_RADIUS = 90.0
+    double LOCAL_CONTRAST_THRESHOLD = 8.0
+
+    double MIN_AREA = 10.0
+    double MAX_AREA = 0.0
+    double DOWNSAMPLE = 1.0
+
+    // --------------------------------------------------------
+    // AUTOMATIC WELL DETECTION
+    // --------------------------------------------------------
+
+    double AUTO_WELL_RED_EXCESS = 12.0
+    double MIN_WELL_IMAGE_FRACTION = 0.08
+    double MAX_WELL_PREVIEW_SIZE = 1400.0
+
+    // --------------------------------------------------------
+    // STANDARD PERIPHERAL BACKGROUND CORRECTION
+    // --------------------------------------------------------
+
+    double RIM_FULL_DEPTH = 90.0
+    double RIM_BLEND_END = 130.0
+    double RIM_BIN_WIDTH = 4.0
+
+    int RIM_BACKGROUND_SECTORS = 24
+    double RIM_BACKGROUND_PERCENTILE = 0.70
+
+    double RIM_CONTRAST_THRESHOLD = 12.0
+    double RIM_LOCAL_DETAIL_THRESHOLD = 5.0
+
+    // --------------------------------------------------------
+    // STANDARD REGION GROWING
+    // --------------------------------------------------------
+
+    double GROW_INTERIOR_CONTRAST_THRESHOLD = 4.0
+    double GROW_RIM_CONTRAST_THRESHOLD = 7.0
+    double GROW_RIM_LOCAL_DETAIL_THRESHOLD = 2.0
+
+    int MAX_GROW_DISTANCE_PIXELS = 60
+
+    boolean SEPARATE_TOUCHING_SPOTS = false
+
+    // --------------------------------------------------------
+    // RIM ARTIFACT PROTECTION
+    //
+    // Applied only in STANDARD mode.
+    // --------------------------------------------------------
+
+    boolean REJECT_CIRCULAR_RIM_ARTIFACT = true
+
+    double RIM_ARTIFACT_CHECK_DEPTH = 18.0
+    double MAX_RIM_ANGULAR_COVERAGE = 0.80
+
+    int RIM_ANGLE_SECTORS = 72
+
+    // --------------------------------------------------------
+    // AUTOMATIC MODE CLASSIFICATION
+    //
+    // Uses peripheral darkness, angular coverage and texture.
+    // These are starting thresholds requiring validation.
+    // --------------------------------------------------------
+
+    double AUTO_CORE_MIN_DEPTH = 140.0
+
+    double AUTO_RIM_MIN_DEPTH = 8.0
+    double AUTO_RIM_MAX_DEPTH = 90.0
+
+    double AUTO_CORE_PERCENTILE = 0.60
+    double AUTO_RIM_PERCENTILE = 0.35
+
+    double AUTO_SECTOR_DARKNESS = 22.0
+    double AUTO_MIN_DARK_SECTOR_FRACTION = 0.67
+
+    double AUTO_TEXTURE_CONTRAST = 6.0
+    double AUTO_MIN_TEXTURE_FRACTION = 0.12
+
+    // --------------------------------------------------------
+    // OPTIONAL NEGATIVE-CONTROL CALIBRATION
+    //
+    // Leave NaN for fully automatic operation without an
+    // external reference.
+    //
+    // To calibrate once, record the "Rim mean darkness"
+    // reported for representative negative-control wells.
+    // Enter the highest observed value here.
+    //
+    // Example:
+    // double NEGATIVE_CONTROL_RIM_DARKNESS = 13.0
+    // --------------------------------------------------------
+
+    double NEGATIVE_CONTROL_RIM_DARKNESS = Double.NaN
+
+    double NEGATIVE_CONTROL_MARGIN = 8.0
+
+    // --------------------------------------------------------
+    // CONFLUENT PERIPHERAL STAINING
+    //
+    // Used only if AUTO selects CONFLUENT or if CONFLUENT
+    // mode is selected manually.
+    // --------------------------------------------------------
+
+    double CONFLUENT_STRONG_DARKNESS = 20.0
+    double CONFLUENT_GROW_DARKNESS = 10.0
+
+    int CONFLUENT_MAX_GROW_DISTANCE = 160
+
+    // --------------------------------------------------------
+    // ANNOTATION SETTINGS
+    // --------------------------------------------------------
+
+    String WELL_NAME = "Well"
+    String SPOT_NAME = "ELISpot spots (merged)"
+
+    String AUTO_KEY = "ELISpot.Automatic"
+
+
+    // ========================================================
+    // STEP 1 - IMAGE SETUP
+    // ========================================================
+
+    def imageData = getCurrentImageData()
+
+    if (imageData == null) {
+        print "ERROR: No image is open."
+        return
+    }
+
+    String requestedMode =
+        PERIPHERAL_DETECTION_MODE.toUpperCase()
+
+    if (!(requestedMode in [
+        "AUTO",
+        "STANDARD",
+        "CONFLUENT"
+    ])) {
+
+        print "ERROR: Invalid peripheral detection mode."
+        return
+    }
+
+    def server = imageData.getServer()
+    def hierarchy = imageData.getHierarchy()
+
+    def plane = ImagePlane.getPlane(0, 0)
+
+    int imageWidth = (int)server.getWidth()
+    int imageHeight = (int)server.getHeight()
+
+    int[] dx = [
+        -1, 0, 1,
+        -1,    1,
+        -1, 0, 1
+    ] as int[]
+
+    int[] dy = [
+        -1, -1, -1,
+         0,      0,
+         1,  1,  1
+    ] as int[]
+
+
+    // ========================================================
+    // HELPER: FIND 8-CONNECTED COMPONENTS
+    // ========================================================
+
+    def eachComponent = {
+        byte[] mask,
+        int w,
+        int h,
+        Closure visitor ->
+
+        boolean[] visited =
+            new boolean[mask.length]
+
+        int[] queue =
+            new int[mask.length]
+
+        for (int start = 0;
+             start < mask.length;
+             start++) {
+
+            if (visited[start] ||
+                (mask[start] & 255) == 0) {
+                continue
+            }
+
+            int head = 0
+            int tail = 0
+
+            visited[start] = true
+            queue[tail++] = start
+
+            while (head < tail) {
+
+                int p = queue[head++]
+
+                int x = p % w
+                int y = (int)(p / w)
+
+                for (int k = 0; k < 8; k++) {
+
+                    int nx = x + dx[k]
+                    int ny = y + dy[k]
+
+                    if (nx < 0 || nx >= w ||
+                        ny < 0 || ny >= h) {
+                        continue
+                    }
+
+                    int ni = ny * w + nx
+
+                    if (!visited[ni] &&
+                        (mask[ni] & 255) != 0) {
+
+                        visited[ni] = true
+                        queue[tail++] = ni
+                    }
+                }
+            }
+
+            visitor(queue, tail)
+        }
+    }
+
+
+    // ========================================================
+    // HELPER: HISTOGRAM PERCENTILE
+    // ========================================================
+
+    def percentile = {
+        int[] histogram,
+        int count,
+        double fraction ->
+
+        if (count == 0) {
+            return Double.NaN
+        }
+
+        int cutoff = Math.max(
+            1,
+            (int)Math.ceil(count * fraction)
+        )
+
+        int sum = 0
+
+        for (int v = 0; v < 256; v++) {
+
+            sum += histogram[v]
+
+            if (sum >= cutoff) {
+                return (double)v
+            }
+        }
+
+        return 255.0
+    }
+
+
+    // ========================================================
+    // STEP 2 - AUTOMATIC WELL DETECTION
+    // ========================================================
+
+    double previewDownsample = Math.max(
+        1.0,
+        Math.max(
+            imageWidth / MAX_WELL_PREVIEW_SIZE,
+            imageHeight / MAX_WELL_PREVIEW_SIZE
+        )
+    )
+
+    def previewRequest = RegionRequest.createInstance(
+        server.getPath(),
+        previewDownsample,
+        0,
+        0,
+        imageWidth,
+        imageHeight,
+        0,
+        0
+    )
+
+    def preview = server.readRegion(previewRequest)
+
+    if (preview == null) {
+        print "ERROR: Could not read image preview."
+        return
+    }
+
+    int pw = preview.getWidth()
+    int ph = preview.getHeight()
+
+    byte[] pink = new byte[pw * ph]
+
+    for (int y = 0; y < ph; y++) {
+        for (int x = 0; x < pw; x++) {
+
+            int rgb = preview.getRGB(x, y)
+
+            int r = (rgb >> 16) & 255
+            int g = (rgb >> 8) & 255
+            int b = rgb & 255
+
+            double redExcess =
+                r - (g + b) / 2.0
+
+            if (r > g &&
+                redExcess >= AUTO_WELL_RED_EXCESS) {
+
+                pink[y * pw + x] = (byte)255
+            }
+        }
+    }
+
+
+    // ========================================================
+    // STEP 3 - FIND LARGEST PINK COMPONENT
+    // ========================================================
+
+    int[] bestPixels = null
+    int bestSize = 0
+
+    eachComponent(pink, pw, ph) {
+        int[] comp,
+        int count ->
+
+        if (count > bestSize) {
+
+            bestSize = count
+
+            bestPixels = Arrays.copyOf(
+                comp,
+                count
+            )
+        }
+    }
+
+    if (bestPixels == null ||
+        bestSize < pink.length *
+            MIN_WELL_IMAGE_FRACTION) {
+
+        print "ERROR: Automatic well detection failed."
+        return
+    }
+
+
+    // ========================================================
+    // STEP 4 - TRACE WELL CONTOUR
+    // ========================================================
+
+    int paddedW = pw + 2
+    int paddedH = ph + 2
+
+    byte[] wellPreviewMask =
+        new byte[paddedW * paddedH]
+
+    for (int i = 0; i < bestSize; i++) {
+
+        int idx = bestPixels[i]
+
+        int x = idx % pw
+        int y = (int)(idx / pw)
+
+        wellPreviewMask[
+            (y + 1) * paddedW + (x + 1)
+        ] = (byte)255
+    }
+
+    def wellWand = new Wand(
+        new ByteProcessor(
+            paddedW,
+            paddedH,
+            wellPreviewMask
+        )
+    )
+
+    int wellSeedX = bestPixels[0] % pw + 1
+    int wellSeedY = (int)(bestPixels[0] / pw) + 1
+
+    wellWand.autoOutline(
+        wellSeedX,
+        wellSeedY,
+        255.0,
+        255.0,
+        Wand.EIGHT_CONNECTED
+    )
+
+    if (wellWand.npoints < 3) {
+        print "ERROR: Well contour tracing failed."
+        return
+    }
+
+    def wellPoints = []
+
+    for (int p = 0; p < wellWand.npoints; p++) {
+
+        double gx =
+            (wellWand.xpoints[p] - 1) *
+            previewDownsample
+
+        double gy =
+            (wellWand.ypoints[p] - 1) *
+            previewDownsample
+
+        wellPoints.add(
+            new Point2(gx, gy)
+        )
+    }
+
+    def wellROI = ROIs.createPolygonROI(
+        wellPoints,
+        plane
+    )
+
+    if (!wellROI.isArea() ||
+        wellROI.getArea() <= 0) {
+
+        print "ERROR: Empty well contour."
+        return
+    }
+
+    print "Automatic well boundary detected."
+
+
+    // ========================================================
+    // STEP 5 - READ FULL-RESOLUTION WELL REGION
+    // ========================================================
+
+    int pad = 4
+
+    int readX = Math.max(
+        0,
+        (int)Math.floor(
+            wellROI.getBoundsX()
+        ) - pad
+    )
+
+    int readY = Math.max(
+        0,
+        (int)Math.floor(
+            wellROI.getBoundsY()
+        ) - pad
+    )
+
+    int right = Math.min(
+        imageWidth,
+        (int)Math.ceil(
+            wellROI.getBoundsX() +
+            wellROI.getBoundsWidth()
+        ) + pad
+    )
+
+    int bottom = Math.min(
+        imageHeight,
+        (int)Math.ceil(
+            wellROI.getBoundsY() +
+            wellROI.getBoundsHeight()
+        ) + pad
+    )
+
+    if (right <= readX || bottom <= readY) {
+
+        print "ERROR: Invalid well read region."
+        return
+    }
+
+    def request = RegionRequest.createInstance(
+        server.getPath(),
+        DOWNSAMPLE,
+        readX,
+        readY,
+        right - readX,
+        bottom - readY,
+        0,
+        0
+    )
+
+    def image = server.readRegion(request)
+
+    if (image == null) {
+        print "ERROR: Could not read well region."
+        return
+    }
+
+    int w = image.getWidth()
+    int h = image.getHeight()
+    int n = w * h
+
+    int ox = request.getX()
+    int oy = request.getY()
+
+
+    // ========================================================
+    // STEP 6 - CREATE GRAYSCALE IMAGE AND WELL MASK
+    // ========================================================
+
+    float[] gray = new float[n]
+    byte[] wellMask = new byte[n]
+
+    int insideCount = 0
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+
+            int idx = y * w + x
+
+            int rgb = image.getRGB(x, y)
+
+            int r = (rgb >> 16) & 255
+            int g = (rgb >> 8) & 255
+            int b = rgb & 255
+
+            gray[idx] = (float)(
+                0.299 * r +
+                0.587 * g +
+                0.114 * b
+            )
+
+            double gx =
+                ox + (x + 0.5) * DOWNSAMPLE
+
+            double gy =
+                oy + (y + 0.5) * DOWNSAMPLE
+
+            if (wellROI.contains(gx, gy)) {
+
+                wellMask[idx] = (byte)255
+                insideCount++
+            }
+        }
+    }
+
+    if (insideCount == 0) {
+        print "ERROR: Empty well mask."
+        return
+    }
+
+
+    // ========================================================
+    // STEP 7 - DISTANCE TO WELL BOUNDARY
+    // ========================================================
+
+    def distanceProcessor =
+        new EDM().makeFloatEDM(
+            new ByteProcessor(
+                w,
+                h,
+                wellMask
+            ),
+            0,
+            false
+        )
+
+    float[] dist =
+        (float[])distanceProcessor.getPixels()
+
+    double cx =
+        wellROI.getBoundsX() +
+        wellROI.getBoundsWidth() / 2.0
+
+    double cy =
+        wellROI.getBoundsY() +
+        wellROI.getBoundsHeight() / 2.0
+
+
+    // ========================================================
+    // STEP 8 - TWO-SCALE BACKGROUND ESTIMATION
+    //
+    // Only pixels inside the well contribute to the blur.
+    // ========================================================
+
+    float[] weightedGray = new float[n]
+    float[] weights = new float[n]
+
+    for (int i = 0; i < n; i++) {
+
+        if ((wellMask[i] & 255) != 0) {
+
+            weightedGray[i] = gray[i]
+            weights[i] = 1.0f
+        }
+    }
+
+    def bg25 = new FloatProcessor(
+        w,
+        h,
+        weightedGray
+    )
+
+    def wt25 = new FloatProcessor(
+        w,
+        h,
+        weights
+    )
+
+    def bg90 = bg25.duplicate()
+    def wt90 = wt25.duplicate()
+
+    def blur = new GaussianBlur()
+
+    blur.blurGaussian(
+        bg25,
+        BACKGROUND_RADIUS / DOWNSAMPLE,
+        BACKGROUND_RADIUS / DOWNSAMPLE,
+        0.01
+    )
+
+    blur.blurGaussian(
+        wt25,
+        BACKGROUND_RADIUS / DOWNSAMPLE,
+        BACKGROUND_RADIUS / DOWNSAMPLE,
+        0.01
+    )
+
+    blur.blurGaussian(
+        bg90,
+        BROAD_BACKGROUND_RADIUS / DOWNSAMPLE,
+        BROAD_BACKGROUND_RADIUS / DOWNSAMPLE,
+        0.01
+    )
+
+    blur.blurGaussian(
+        wt90,
+        BROAD_BACKGROUND_RADIUS / DOWNSAMPLE,
+        BROAD_BACKGROUND_RADIUS / DOWNSAMPLE,
+        0.01
+    )
+
+    float[] b25 = (float[])bg25.getPixels()
+    float[] v25 = (float[])wt25.getPixels()
+
+    float[] b90 = (float[])bg90.getPixels()
+    float[] v90 = (float[])wt90.getPixels()
+
+
+    // ========================================================
+    // STEP 9 - CREATE ANGULAR AND RADIAL HISTOGRAMS
+    //
+    // The standard detection algorithm is preserved.
+    // The additional measurements also help select AUTO mode.
+    // ========================================================
+
+    double binPx =
+        RIM_BIN_WIDTH / DOWNSAMPLE
+
+    int bins =
+        (int)Math.ceil(
+            RIM_BLEND_END / RIM_BIN_WIDTH
+        ) + 3
+
+    int[][][] hist =
+        new int[RIM_BACKGROUND_SECTORS][bins][256]
+
+    int[][] counts =
+        new int[RIM_BACKGROUND_SECTORS][bins]
+
+    int[][] rimHist =
+        new int[RIM_BACKGROUND_SECTORS][256]
+
+    int[] rimCounts =
+        new int[RIM_BACKGROUND_SECTORS]
+
+    int[] coreHist = new int[256]
+
+    int coreCount = 0
+    int rimCount = 0
+    int texturedRim = 0
+
+
+    // --------------------------------------------------------
+    // ANGULAR SECTOR HELPER
+    // --------------------------------------------------------
+
+    def sectorOf = {
+        double gx,
+        double gy,
+        int sectors ->
+
+        double angle = Math.atan2(
+            gy - cy,
+            gx - cx
+        )
+
+        return Math.max(
+            0,
+            Math.min(
+                sectors - 1,
+                (int)Math.floor(
+                    (angle + Math.PI) /
+                    (2.0 * Math.PI) *
+                    sectors
+                )
+            )
+        )
+    }
+
+
+    // --------------------------------------------------------
+    // ACCUMULATE HISTOGRAMS
+    // --------------------------------------------------------
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+
+            int i = y * w + x
+
+            if ((wellMask[i] & 255) == 0) {
+                continue
+            }
+
+            double d = dist[i] * DOWNSAMPLE
+
+            int val = Math.max(
+                0,
+                Math.min(
+                    255,
+                    Math.round(gray[i])
+                )
+            )
+
+            double gx =
+                ox + (x + 0.5) * DOWNSAMPLE
+
+            double gy =
+                oy + (y + 0.5) * DOWNSAMPLE
+
+            int sec = sectorOf(
+                gx,
+                gy,
+                RIM_BACKGROUND_SECTORS
+            )
+
+            // Standard peripheral background histogram
+
+            if (d <= RIM_BLEND_END + RIM_BIN_WIDTH) {
+
+                int bin = Math.min(
+                    bins - 1,
+                    (int)Math.floor(
+                        dist[i] / binPx
+                    )
+                )
+
+                hist[sec][bin][val]++
+                counts[sec][bin]++
+            }
+
+            // Core background reference
+
+            if (d >= AUTO_CORE_MIN_DEPTH) {
+
+                coreHist[val]++
+                coreCount++
+            }
+
+            // Peripheral signal characterization
+
+            if (d >= AUTO_RIM_MIN_DEPTH &&
+                d <= AUTO_RIM_MAX_DEPTH) {
+
+                rimHist[sec][val]++
+                rimCounts[sec]++
+                rimCount++
+
+                double local25 =
+                    b25[i] /
+                    Math.max(0.000001, v25[i])
+
+                double local90 =
+                    b90[i] /
+                    Math.max(0.000001, v90[i])
+
+                double textureContrast =
+                    Math.max(local25, local90) -
+                    gray[i]
+
+                if (textureContrast >=
+                    AUTO_TEXTURE_CONTRAST) {
+
+                    texturedRim++
+                }
+            }
+        }
+    }
+
+
+    // ========================================================
+    // STEP 10 - CORE REFERENCE FALLBACK
+    // ========================================================
+
+    if (coreCount == 0) {
+
+        for (int i = 0; i < n; i++) {
+
+            if ((wellMask[i] & 255) == 0) {
+                continue
+            }
+
+            int val = Math.max(
+                0,
+                Math.min(
+                    255,
+                    Math.round(gray[i])
+                )
+            )
+
+            coreHist[val]++
+            coreCount++
+        }
+    }
+
+
+    // ========================================================
+    // STEP 11 - STANDARD PERIPHERAL BACKGROUND PROFILE
+    // ========================================================
+
+    double[][] raw =
+        new double[RIM_BACKGROUND_SECTORS][bins]
+
+    for (int sec = 0;
+         sec < RIM_BACKGROUND_SECTORS;
+         sec++) {
+
+        for (int bin = 0; bin < bins; bin++) {
+
+            raw[sec][bin] = percentile(
+                hist[sec][bin],
+                counts[sec][bin],
+                RIM_BACKGROUND_PERCENTILE
+            )
+        }
+
+        // Fill empty radial bins.
+
+        for (int bin = 0; bin < bins; bin++) {
+
+            if (!Double.isNaN(raw[sec][bin])) {
+                continue
+            }
+
+            int closest = -1
+            int minDistance = Integer.MAX_VALUE
+
+            for (int j = 0; j < bins; j++) {
+
+                if (Double.isNaN(raw[sec][j])) {
+                    continue
+                }
+
+                int distance = Math.abs(j - bin)
+
+                if (distance < minDistance) {
+
+                    closest = j
+                    minDistance = distance
+                }
+            }
+
+            if (closest >= 0) {
+                raw[sec][bin] =
+                    raw[sec][closest]
+            }
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // FILL EMPTY ANGULAR SECTORS
+    // --------------------------------------------------------
+
+    for (int sec = 0;
+         sec < RIM_BACKGROUND_SECTORS;
+         sec++) {
+
+        if (!Double.isNaN(raw[sec][0])) {
+            continue
+        }
+
+        for (int offset = 1;
+             offset < RIM_BACKGROUND_SECTORS;
+             offset++) {
+
+            int other =
+                (sec + offset) %
+                RIM_BACKGROUND_SECTORS
+
+            if (!Double.isNaN(raw[other][0])) {
+
+                for (int bin = 0; bin < bins; bin++) {
+
+                    raw[sec][bin] =
+                        raw[other][bin]
+                }
+
+                break
+            }
+        }
+    }
+
+    if (Double.isNaN(raw[0][0])) {
+
+        print "ERROR: Could not estimate rim background."
+        return
+    }
+
+
+    // --------------------------------------------------------
+    // MEDIAN SMOOTHING ACROSS ADJACENT SECTORS
+    // --------------------------------------------------------
+
+    double[][] rimBackground =
+        new double[RIM_BACKGROUND_SECTORS][bins]
+
+    for (int sec = 0;
+         sec < RIM_BACKGROUND_SECTORS;
+         sec++) {
+
+        int prev =
+            (sec - 1 + RIM_BACKGROUND_SECTORS) %
+            RIM_BACKGROUND_SECTORS
+
+        int next =
+            (sec + 1) %
+            RIM_BACKGROUND_SECTORS
+
+        for (int bin = 0; bin < bins; bin++) {
+
+            double a = raw[prev][bin]
+            double b = raw[sec][bin]
+            double c = raw[next][bin]
+
+            rimBackground[sec][bin] = Math.max(
+                Math.min(a, b),
+                Math.min(Math.max(a, b), c)
+            )
+        }
+    }
+
+
+    // ========================================================
+    // STEP 12 - AUTOMATIC PERIPHERAL CLASSIFICATION
+    //
+    // Compare the peripheral signal with the well interior.
+    //
+    // A confluent classification requires:
+    //   1. Widespread peripheral darkness
+    //   2. Sufficient local dark texture
+    //
+    // The algorithm does not assume that every dark rim is
+    // genuine positive staining.
+    // ========================================================
+
+    double coreRef = percentile(
+        coreHist,
+        coreCount,
+        AUTO_CORE_PERCENTILE
+    )
+
+    double sectorThreshold =
+        AUTO_SECTOR_DARKNESS
+
+    if (Double.isFinite(
+        NEGATIVE_CONTROL_RIM_DARKNESS
+    )) {
+
+        sectorThreshold = Math.max(
+            sectorThreshold,
+            NEGATIVE_CONTROL_RIM_DARKNESS +
+                NEGATIVE_CONTROL_MARGIN
+        )
+    }
+
+    int darkSectors = 0
+    int populated = 0
+
+    double darknessSum = 0.0
+
+    for (int sec = 0;
+         sec < RIM_BACKGROUND_SECTORS;
+         sec++) {
+
+        if (rimCounts[sec] == 0) {
+            continue
+        }
+
+        double rimQ = percentile(
+            rimHist[sec],
+            rimCounts[sec],
+            AUTO_RIM_PERCENTILE
+        )
+
+        double darkness =
+            coreRef - rimQ
+
+        darknessSum += darkness
+        populated++
+
+        if (darkness >= sectorThreshold) {
+            darkSectors++
+        }
+    }
+
+    double sectorFraction =
+        populated > 0 ?
+            (double)darkSectors / populated :
+            0.0
+
+    double textureFraction =
+        rimCount > 0 ?
+            (double)texturedRim / rimCount :
+            0.0
+
+    double rimMeanDarkness =
+        populated > 0 ?
+            darknessSum / populated :
+            0.0
+
+    boolean hasConfluentEvidence =
+        sectorFraction >=
+            AUTO_MIN_DARK_SECTOR_FRACTION &&
+        textureFraction >=
+            AUTO_MIN_TEXTURE_FRACTION
+
+
+    // ========================================================
+    // STEP 13 - SELECT THE DETECTION MODE
+    // ========================================================
+
+    String mode
+
+    if (requestedMode == "AUTO") {
+
+        mode = hasConfluentEvidence ?
+            "CONFLUENT" :
+            "STANDARD"
+
+    } else {
+
+        mode = requestedMode
+    }
+
+    boolean borderline =
+        Math.abs(
+            sectorFraction -
+            AUTO_MIN_DARK_SECTOR_FRACTION
+        ) < 0.10 ||
+        Math.abs(
+            textureFraction -
+            AUTO_MIN_TEXTURE_FRACTION
+        ) < 0.04
+
+    boolean review =
+        requestedMode == "AUTO" &&
+        (
+            borderline ||
+            (
+                mode == "CONFLUENT" &&
+                !Double.isFinite(
+                    NEGATIVE_CONTROL_RIM_DARKNESS
+                )
+            )
+        )
+
+    print String.format(
+        Locale.US,
+        "Mode: %s (requested %s) | Core %.1f | Rim mean darkness %.1f | Dark sectors %.1f%% | Textured rim %.1f%%",
+        mode,
+        requestedMode,
+        coreRef,
+        rimMeanDarkness,
+        100.0 * sectorFraction,
+        100.0 * textureFraction
+    )
+
+    if (review) {
+
+        print "REVIEW RECOMMENDED: Peripheral classification is borderline or uncalibrated."
+    }
+
+    // In STANDARD mode, retain the original circumferential
+    // artifact rejection.
+    //
+    // In CONFLUENT mode, preserve widespread dark staining.
+
+    boolean rejectRim =
+        REJECT_CIRCULAR_RIM_ARTIFACT &&
+        mode == "STANDARD"
+
+
+    // ========================================================
+    // STEP 14 - BUILD STRONG AND WEAK CANDIDATE MASKS
+    //
+    // Standard detection remains unchanged.
+    //
+    // Confluent mode uses the well interior as an additional
+    // background reference for peripheral staining.
+    // ========================================================
+
+    byte[] seeds = new byte[n]
+    byte[] weak = new byte[n]
+
+    int seedCount = 0
+
+    for (int y = 0; y < h; y++) {
+        for (int x = 0; x < w; x++) {
+
+            int i = y * w + x
+
+            if ((wellMask[i] & 255) == 0) {
+                continue
+            }
+
+            double local25 =
+                b25[i] /
+                Math.max(0.000001, v25[i])
+
+            double local90 =
+                b90[i] /
+                Math.max(0.000001, v90[i])
+
+            double localEvidence = Math.max(
+                local25 - gray[i],
+                local90 - gray[i]
+            )
+
+            double localBackground =
+                Math.max(local25, local90)
+
+            double d =
+                dist[i] * DOWNSAMPLE
+
+            // Peripheral weighting
+
+            double rimWeight
+
+            if (d <= RIM_FULL_DEPTH) {
+
+                rimWeight = 1.0
+
+            } else if (d >= RIM_BLEND_END) {
+
+                rimWeight = 0.0
+
+            } else {
+
+                rimWeight =
+                    (RIM_BLEND_END - d) /
+                    (RIM_BLEND_END - RIM_FULL_DEPTH)
+            }
+
+            double contrast = localEvidence
+
+            // ------------------------------------------------
+            // STANDARD ANGULAR/RADIAL BACKGROUND CORRECTION
+            // ------------------------------------------------
+
+            if (rimWeight > 0) {
+
+                double gx =
+                    ox + (x + 0.5) * DOWNSAMPLE
+
+                double gy =
+                    oy + (y + 0.5) * DOWNSAMPLE
+
+                double angle = Math.atan2(
+                    gy - cy,
+                    gx - cx
+                )
+
+                double sp =
+                    (angle + Math.PI) /
+                    (2.0 * Math.PI) *
+                    RIM_BACKGROUND_SECTORS - 0.5
+
+                int sf = (int)Math.floor(sp)
+
+                double fs = sp - sf
+
+                int s0 =
+                    (
+                        (sf % RIM_BACKGROUND_SECTORS) +
+                        RIM_BACKGROUND_SECTORS
+                    ) % RIM_BACKGROUND_SECTORS
+
+                int s1 =
+                    (s0 + 1) %
+                    RIM_BACKGROUND_SECTORS
+
+                double bp = Math.max(
+                    0.0,
+                    Math.min(
+                        bins - 1.0,
+                        dist[i] / binPx - 0.5
+                    )
+                )
+
+                int b0 = (int)Math.floor(bp)
+                int b1 = Math.min(bins - 1, b0 + 1)
+
+                double fb = bp - b0
+
+                double q0 =
+                    (1.0 - fb) *
+                        rimBackground[s0][b0] +
+                    fb *
+                        rimBackground[s0][b1]
+
+                double q1 =
+                    (1.0 - fb) *
+                        rimBackground[s1][b0] +
+                    fb *
+                        rimBackground[s1][b1]
+
+                double rimReference =
+                    (1.0 - fs) * q0 +
+                    fs * q1
+
+                double mixed =
+                    rimWeight * rimReference +
+                    (1.0 - rimWeight) *
+                        localBackground
+
+                contrast = mixed - gray[i]
+            }
+
+
+            // ------------------------------------------------
+            // STANDARD STRONG SEED THRESHOLD
+            // ------------------------------------------------
+
+            double strongThreshold =
+                LOCAL_CONTRAST_THRESHOLD +
+                rimWeight *
+                (
+                    RIM_CONTRAST_THRESHOLD -
+                    LOCAL_CONTRAST_THRESHOLD
+                )
+
+            double weakThreshold =
+                GROW_INTERIOR_CONTRAST_THRESHOLD +
+                rimWeight *
+                (
+                    GROW_RIM_CONTRAST_THRESHOLD -
+                    GROW_INTERIOR_CONTRAST_THRESHOLD
+                )
+
+            boolean strong =
+                contrast >= strongThreshold &&
+                localEvidence >=
+                    rimWeight *
+                    RIM_LOCAL_DETAIL_THRESHOLD
+
+            boolean growing =
+                contrast >= weakThreshold &&
+                localEvidence >=
+                    rimWeight *
+                    GROW_RIM_LOCAL_DETAIL_THRESHOLD
+
+
+            // ------------------------------------------------
+            // ADDITIONAL CONFLUENT DETECTION
+            //
+            // Only activates for CONFLUENT wells.
+            //
+            // Pixels can qualify using their darkness relative
+            // to the less-stained interior.
+            // ------------------------------------------------
+
+            if (mode == "CONFLUENT" &&
+                rimWeight >= 0.5) {
+
+                double coreDarkness =
+                    coreRef - gray[i]
+
+                strong =
+                    strong ||
+                    coreDarkness >=
+                        CONFLUENT_STRONG_DARKNESS
+
+                growing =
+                    growing ||
+                    coreDarkness >=
+                        CONFLUENT_GROW_DARKNESS
+            }
+
+
+            // ------------------------------------------------
+            // STORE STRONG/WEAK PIXELS
+            // ------------------------------------------------
+
+            if (strong) {
+
+                seeds[i] = (byte)255
+                seedCount++
+            }
+
+            if (strong || growing) {
+
+                weak[i] = (byte)255
+            }
+        }
+    }
+
+    print "Strong seed pixels: ${seedCount}"
+
+
+    // ========================================================
+    // STEP 15 - CIRCUMFERENTIAL ARTIFACT TEST
+    // ========================================================
+
+    def rimCoverage = {
+        int[] pixels,
+        int count ->
+
+        boolean[] occupied =
+            new boolean[RIM_ANGLE_SECTORS]
+
+        int num = 0
+
+        for (int j = 0; j < count; j++) {
+
+            int i = pixels[j]
+
+            if (dist[i] * DOWNSAMPLE >
+                RIM_ARTIFACT_CHECK_DEPTH) {
+                continue
+            }
+
+            int x = i % w
+            int y = (int)(i / w)
+
+            double gx =
+                ox + (x + 0.5) * DOWNSAMPLE
+
+            double gy =
+                oy + (y + 0.5) * DOWNSAMPLE
+
+            int sec = sectorOf(
+                gx,
+                gy,
+                RIM_ANGLE_SECTORS
+            )
+
+            if (!occupied[sec]) {
+
+                occupied[sec] = true
+                num++
+            }
+        }
+
+        return (double)num / RIM_ANGLE_SECTORS
+    }
+
+
+    // ========================================================
+    // STEP 16 - REMOVE CONTINUOUS RIM ARTIFACTS
+    //
+    // Only applied in STANDARD mode.
+    // ========================================================
+
+    def removeContinuousRim = {
+        byte[] mask ->
+
+        int[] results = [0, 0] as int[]
+
+        if (!rejectRim) {
+            return results
+        }
+
+        eachComponent(mask, w, h) {
+            int[] pixels,
+            int count ->
+
+            double coverage =
+                rimCoverage(pixels, count)
+
+            if (coverage >=
+                MAX_RIM_ANGULAR_COVERAGE) {
+
+                for (int j = 0; j < count; j++) {
+
+                    mask[pixels[j]] = (byte)0
+                }
+
+                results[0]++
+                results[1] += count
+            }
+        }
+
+        return results
+    }
+
+    int[] beforeGrowth =
+        removeContinuousRim(seeds)
+
+
+    // ========================================================
+    // STEP 17 - SEEDED REGION GROWING
+    //
+    // Strong pixels initiate a detection.
+    //
+    // Adjacent weaker pixels can join that detection.
+    //
+    // Weaker pixels without an attached seed cannot initiate
+    // a new region.
+    // ========================================================
+
+    int limit =
+        mode == "CONFLUENT" ?
+            CONFLUENT_MAX_GROW_DISTANCE :
+            MAX_GROW_DISTANCE_PIXELS
+
+    byte[] candidate = new byte[n]
+
+    int[] steps = new int[n]
+
+    Arrays.fill(steps, -1)
+
+    int[] queue = new int[n]
+
+    int head = 0
+    int tail = 0
+
+    for (int i = 0; i < n; i++) {
+
+        if ((seeds[i] & 255) != 0) {
+
+            candidate[i] = (byte)255
+            steps[i] = 0
+
+            queue[tail++] = i
+        }
+    }
+
+
+    // --------------------------------------------------------
+    // EIGHT-CONNECTED BREADTH-FIRST REGION GROWTH
+    // --------------------------------------------------------
+
+    while (head < tail) {
+
+        int p = queue[head++]
+
+        if (steps[p] >= limit) {
+            continue
+        }
+
+        int x = p % w
+        int y = (int)(p / w)
+
+        for (int k = 0; k < 8; k++) {
+
+            int nx = x + dx[k]
+            int ny = y + dy[k]
+
+            if (nx < 0 || nx >= w ||
+                ny < 0 || ny >= h) {
+                continue
+            }
+
+            int ni = ny * w + nx
+
+            if (steps[ni] != -1 ||
+                (weak[ni] & 255) == 0) {
+                continue
+            }
+
+            steps[ni] = steps[p] + 1
+
+            candidate[ni] = (byte)255
+
+            queue[tail++] = ni
+        }
+    }
+
+    int[] afterGrowth =
+        removeContinuousRim(candidate)
+
+    print "Pixels after region growing: ${tail}"
+
+
+    // ========================================================
+    // STEP 18 - OPTIONAL WATERSHED
+    //
+    // Disabled by default to preserve total spot area.
+    // ========================================================
+
+    if (SEPARATE_TOUCHING_SPOTS) {
+
+        def bp = new ByteProcessor(
+            w,
+            h,
+            candidate
+        )
+
+        new EDM().toWatershed(bp)
+
+        candidate =
+            (byte[])bp.getPixels()
+
+        for (int i = 0; i < n; i++) {
+
+            if ((wellMask[i] & 255) == 0) {
+
+                candidate[i] = (byte)0
+            }
+        }
+    }
+
+
+    // ========================================================
+    // STEP 19 - APPLY AREA FILTER
+    //
+    // This creates one accepted binary mask.
+    //
+    // It preserves the complete shape of large confluent
+    // regions, including disconnected areas and internal holes.
+    // ========================================================
+
+    byte[] accepted = new byte[n]
+
+    int regionCount = 0
+    int rejectedFinal = 0
+
+    eachComponent(candidate, w, h) {
+        int[] pixels,
+        int count ->
+
+        double area =
+            count * DOWNSAMPLE * DOWNSAMPLE
+
+        if (area < MIN_AREA) {
+            return
+        }
+
+        if (MAX_AREA > 0 && area > MAX_AREA) {
+            return
+        }
+
+        if (rejectRim &&
+            rimCoverage(pixels, count) >=
+                MAX_RIM_ANGULAR_COVERAGE) {
+
+            rejectedFinal++
+            return
+        }
+
+        for (int j = 0; j < count; j++) {
+
+            accepted[pixels[j]] = (byte)255
+        }
+
+        regionCount++
+    }
+
+
+    // ========================================================
+    // STEP 20 - CREATE ONE MERGED SPOT ROI
+    //
+    // A binary-mask-to-ROI conversion preserves interior holes.
+    //
+    // Unlike tracing only the outer boundary of a dark ring,
+    // this avoids filling the unstained center and inflating
+    // the total spot area measurement.
+    // ========================================================
+
+    def mergedROI = null
+
+    if (regionCount > 0) {
+
+        def bp = new ByteProcessor(
+            w,
+            h,
+            accepted
+        )
+
+        bp.setThreshold(
+            1,
+            255,
+            ImageProcessor.NO_LUT_UPDATE
+        )
+
+        def ijROI =
+            IJProcessing.thresholdToRoi(bp)
+
+        if (ijROI != null) {
+
+            mergedROI = IJTools.convertToROI(
+                ijROI,
+                request
+            )
+
+            // Restrict merged regions to the well.
+
+            mergedROI = RoiTools.combineROIs(
+                mergedROI,
+                wellROI,
+                RoiTools.CombineOp.INTERSECT
+            )
+        }
+    }
+
+
+    // ========================================================
+    // STEP 21 - CREATE WELL ANNOTATION
+    // ========================================================
+
+    def wellObject =
+        PathObjects.createAnnotationObject(
+            wellROI,
+            getPathClass("Region")
+        )
+
+    wellObject.setName(WELL_NAME)
+
+    wellObject.getMetadata().put(
+        AUTO_KEY,
+        "true"
+    )
+
+    wellObject.getMetadata().put(
+        "ELISpot.Mode",
+        mode
+    )
+
+    wellObject.getMetadata().put(
+        "ELISpot.Review",
+        review.toString()
+    )
+
+    wellObject.getMetadata().put(
+        "ELISpot.RimMeanDarkness",
+        String.format(
+            Locale.US,
+            "%.3f",
+            rimMeanDarkness
+        )
+    )
+
+
+    // ========================================================
+    // STEP 22 - CREATE MERGED SPOT ANNOTATION
+    // ========================================================
+
+    def spotObject = null
+
+    if (mergedROI != null &&
+        mergedROI.isArea() &&
+        mergedROI.getArea() > 0) {
+
+        spotObject =
+            PathObjects.createAnnotationObject(
+                mergedROI,
+                getPathClass("Spot")
+            )
+
+        spotObject.setName(SPOT_NAME)
+
+        spotObject.getMetadata().put(
+            AUTO_KEY,
+            "true"
+        )
+
+        spotObject.getMetadata().put(
+            "ELISpot.Mode",
+            mode
+        )
+
+        spotObject.getMetadata().put(
+            "ELISpot.Review",
+            review.toString()
+        )
+    }
+
+
+    // ========================================================
+    // STEP 23 - REMOVE PREVIOUS GENERATED ANNOTATIONS
+    //
+    // Preserve:
+    //   - Locked annotations
+    //   - Manually created well annotations
+    //   - Unrelated annotations
+    // ========================================================
+
+    def previous =
+        hierarchy.getAnnotationObjects().findAll {
+            obj ->
+
+            if (obj.isLocked()) {
+                return false
+            }
+
+            boolean automatic =
+                obj.hasMetadata() &&
+                obj.getMetadata().get(AUTO_KEY) ==
+                    "true"
+
+            boolean oldSpot =
+                obj.getName() == SPOT_NAME ||
+                obj.getName() == "ELISpot spot"
+
+            boolean autoWell =
+                obj.getName() == WELL_NAME &&
+                automatic
+
+            return oldSpot || autoWell
+        }
+
+    if (!previous.isEmpty()) {
+
+        hierarchy.removeObjects(
+            previous,
+            true
+        )
+    }
+
+
+    // ========================================================
+    // STEP 24 - ADD NEW ANNOTATIONS
+    // ========================================================
+
+    hierarchy.addObject(wellObject)
+
+    if (spotObject != null) {
+
+        hierarchy.addObject(spotObject)
+    }
+
+    hierarchy.getSelectionModel().setSelectedObject(
+        spotObject != null ?
+            spotObject :
+            wellObject
+    )
+
+    fireHierarchyUpdate()
+
+
+    // ========================================================
+    // FINAL RESULTS
+    // ========================================================
+
+    print "========================================"
+    print "ELISPOT ANALYSIS COMPLETE"
+    print "========================================"
+
+    print "Requested detection mode: ${requestedMode}"
+    print "Mode chosen: ${mode}"
+
+    print "Well annotation created: YES"
+
+    print "Merged spot annotation created: " +
+        (spotObject != null ? "YES" : "NO")
+
+    print "Regions contributing to merged mask: " +
+        "${regionCount}"
+
+    print "Rim artifacts removed before growth: " +
+        "${beforeGrowth[0]}"
+
+    print "Rim artifacts removed after growth: " +
+        "${afterGrowth[0]}"
+
+    print "Rim artifacts rejected at final filter: " +
+        "${rejectedFinal}"
+
+    print "Review suggested: ${review}"
+
+    print String.format(
+        Locale.US,
+        "Rim mean darkness (calibration aid): %.3f",
+        rimMeanDarkness
+    )
+
+    print "========================================"
+}
+
+analyzeELISpot()
