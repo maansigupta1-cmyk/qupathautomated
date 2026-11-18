@@ -1,0 +1,134 @@
+
+import static qupath.lib.gui.scripting.QPEx.*
+
+// ================================================
+// IDENTIFY WELLS WITHOUT ANNOTATIONS
+// QuPath 0.7.0
+// ================================================
+
+def project = getProject()
+
+if (project == null) {
+    println "ERROR: Please open a QuPath project first."
+    return
+}
+
+// Lists to store results
+def noAnnotations = []
+def boundaryOnly = []
+def analyzed = []
+def errors = []
+
+// Check every image in the project
+for (def entry in project.getImageList()) {
+
+    def filename = entry.getImageName()
+
+    try {
+
+        // Read saved annotations without opening image pixels
+        def hierarchy = entry.readHierarchy()
+        def annotations = hierarchy.getAnnotationObjects()
+
+        analyzed << filename
+
+        // CATEGORY 1: No annotations at all
+        if (annotations.isEmpty()) {
+
+            noAnnotations << filename
+
+        } else {
+
+            // Exclude annotations named "Well"
+            def otherAnnotations = annotations.findAll { ann ->
+
+                def name = ann.getName()
+
+                return name == null ||
+                    !name.trim().equalsIgnoreCase("Well")
+            }
+
+            // CATEGORY 2: Only well-boundary annotations
+            if (otherAnnotations.isEmpty()) {
+                boundaryOnly << filename
+            }
+        }
+
+    } catch (Exception e) {
+
+        errors << filename + " : " + e.getMessage()
+    }
+}
+
+// Sort filenames alphabetically
+noAnnotations.sort()
+boundaryOnly.sort()
+
+// ================================================
+// DISPLAY RESULTS
+// ================================================
+
+println ""
+println "========================================"
+println "     QUPATH ANNOTATION AUDIT"
+println "========================================"
+
+println "Total project images: " + project.getImageList().size()
+println "Successfully checked: " + analyzed.size()
+
+println ""
+println "----------------------------------------"
+println "CATEGORY 1: NO ANNOTATIONS"
+println "----------------------------------------"
+
+println "Number of wells: " + noAnnotations.size()
+println ""
+
+if (noAnnotations.isEmpty()) {
+
+    println "All checked wells contain annotations."
+
+} else {
+
+    noAnnotations.each { filename ->
+        println filename
+    }
+}
+
+println ""
+println "----------------------------------------"
+println "CATEGORY 2: WELL BOUNDARY ONLY"
+println "----------------------------------------"
+
+println "Number of wells: " + boundaryOnly.size()
+println ""
+
+if (boundaryOnly.isEmpty()) {
+
+    println "No wells found with only a Well annotation."
+
+} else {
+
+    boundaryOnly.each { filename ->
+        println filename
+    }
+}
+
+println ""
+println "----------------------------------------"
+println "ERRORS"
+println "----------------------------------------"
+
+if (errors.isEmpty()) {
+
+    println "None"
+
+} else {
+
+    errors.each { println it }
+}
+
+println ""
+println "========================================"
+println "AUDIT COMPLETE"
+println "========================================"
